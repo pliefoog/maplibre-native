@@ -54,6 +54,38 @@ std::vector<ContourLineString> generateContours(std::span<const std::int16_t> he
                                                 int height,
                                                 const ContourThresholds& thresholds);
 
+/// Generate contour lines at an EXPLICIT, arbitrarily-spaced set of
+/// threshold levels, instead of a constant interval. Needed for maritime
+/// depth-band charting convention (see algorithm/contour/levels.hpp): a
+/// constant `ContourThresholds::interval` cannot reproduce a breakpoint
+/// list like [0, 2, 5, 10, 20, 50, 100, 250, 500, 1000, 2000, 3000, 4000,
+/// 5000] (deltas of 2, 3, 5, 10, 30, 50, 150, 250, 500, 1000 — not
+/// constant).
+///
+/// Uses the same marching-squares cell traversal, saddle handling, and
+/// fragment-stitching as `generateContours` (deliberately duplicated rather
+/// than refactored into a shared helper here — this codebase's other
+/// pure-algorithm modules, e.g. `generateContours` itself, are extensively
+/// unit- and render-tested upstream; restructuring proven, stitching-
+/// sensitive code without that same test harness available in this
+/// environment is a real regression risk this file avoids by keeping the
+/// two entry points independent).
+///
+/// @param heights same grid convention as `generateContours`.
+/// @param width, height same as `generateContours`.
+/// @param levels ascending, distinct threshold values. Levels outside a
+///   given cell's [min, max] corner range are simply skipped for that
+///   cell (same effect as `generateContours`' start/end-level clamping).
+/// @param extent tile-local coordinate scale (MVT default = 4096).
+/// @return One ContourLineString per stitched polyline, one group per
+///   input level (levels with no crossings anywhere in the grid are
+///   simply absent from the result, same as `generateContours`).
+std::vector<ContourLineString> generateContoursAtLevels(std::span<const std::int16_t> heights,
+                                                        int width,
+                                                        int height,
+                                                        const std::vector<double>& levels,
+                                                        int extent = 4096);
+
 } // namespace contour
 } // namespace algorithm
 } // namespace mbgl

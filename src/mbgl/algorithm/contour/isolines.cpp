@@ -279,6 +279,137 @@ std::vector<ContourLineString> generateContours(std::span<const std::int16_t> he
     return result;
 }
 
+std::vector<ContourLineString> generateContoursAtLevels(std::span<const std::int16_t> heights,
+                                                        int width,
+                                                        int height,
+                                                        const std::vector<double>& levels,
+                                                        int extent) {
+    if (levels.empty()) {
+        return {};
+    }
+    if (width < 2 || height < 2) {
+        return {};
+    }
+    if (static_cast<std::ptrdiff_t>(heights.size()) < static_cast<std::ptrdiff_t>(width) * height) {
+        return {};
+    }
+
+    const double multiplier = static_cast<double>(extent) / static_cast<double>(width - 1);
+
+    // Keyed by INDEX into `levels` (not a rounded interval multiple, since
+    // levels here are arbitrarily spaced) — same fragment-stitching
+    // structure as generateContours, one LevelState per distinct threshold.
+    std::unordered_map<std::size_t, LevelState> levelStates;
+
+    auto sample = [&](int x, int y) -> double {
+        if (x < 0 || x >= width || y < 0 || y >= height) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return static_cast<double>(heights[y * width + x]);
+    };
+
+    for (int r = 1; r < height; r++) {
+        for (int c = 1; c < width; c++) {
+            const double tl = sample(c - 1, r - 1);
+            const double tr = sample(c, r - 1);
+            const double bl = sample(c - 1, r);
+            const double br = sample(c, r);
+            if (std::isnan(tl) || std::isnan(tr) || std::isnan(bl) || std::isnan(br)) {
+                continue;
+            }
+
+            const double minV = std::min({tl, tr, bl, br});
+            const double maxV = std::max({tl, tr, bl, br});
+
+            // Levels are ascending; skip ahead to the first one that could
+            // possibly cross this cell, and stop once we're past maxV — a
+            // cheap two-pointer-style bound, same cost profile as
+            // generateContours' ceil/floor interval bounds.
+            for (std::size_t li = 0; li < levels.size(); ++li) {
+                const double level = levels[li];
+                if (level < minV) continue;
+                if (level > maxV) break; // ascending: no later level fits either
+
+                const int idx = (tl > level ? 8 : 0) | (tr > level ? 4 : 0) | (br > level ? 2 : 0) |
+                                (bl > level ? 1 : 0);
+                const int nSegments = SEGMENT_COUNT[idx];
+                if (nSegments == 0) continue;
+
+                LevelState& state = levelStates[li];
+
+                for (int s = 0; s < nSegments; s++) {
+                    const Segment seg = CASES[idx][s];
+                    double sx, sy, ex, ey;
+                    edgePosition(seg.start, c, r, tl, tr, bl, br, level, sx, sy);
+                    edgePosition(seg.end, c, r, tl, tr, bl, br, level, ex, ey);
+                    const std::int32_t sxi = scaleCoord(sx, multiplier);
+                    const std::int32_t syi = scaleCoord(sy, multiplier);
+                    const std::int32_t exi = scaleCoord(ex, multiplier);
+                    const std::int32_t eyi = scaleCoord(ey, multiplier);
+
+                    const std::uint64_t startIdx = edgeIndex(width, c, r, seg.start);
+                    const std::uint64_t endIdx = edgeIndex(width, c, r, seg.end);
+
+                    auto fByEnd = state.byEnd.find(startIdx);
+                    auto fByStart = state.byStart.find(endIdx);
+
+                    if (fByEnd != state.byEnd.end()) {
+                        const std::size_t fIdx = fByEnd->second;
+                        Fragment& f = state.fragments[fIdx];
+                        state.byEnd.erase(fByEnd);
+
+                        if (fByStart != state.byStart.end()) {
+                            const std::size_t gIdx = fByStart->second;
+                            state.byStart.erase(fByStart);
+                            if (fIdx == gIdx) {
+                                appendPoint(f, exi, eyi);
+                            } else {
+                                Fragment& g = state.fragments[gIdx];
+                                f.points.insert(f.points.end(), g.points.begin(), g.points.end());
+                                f.end = g.end;
+                                g.merged = true;
+                                state.byEnd[f.end] = fIdx;
+                            }
+                        } else {
+                            appendPoint(f, exi, eyi);
+                            f.end = endIdx;
+                            state.byEnd[endIdx] = fIdx;
+                        }
+                    } else if (fByStart != state.byStart.end()) {
+                        const std::size_t fIdx = fByStart->second;
+                        Fragment& f = state.fragments[fIdx];
+                        state.byStart.erase(fByStart);
+                        prependPoint(f, sxi, syi);
+                        f.start = startIdx;
+                        state.byStart[startIdx] = fIdx;
+                    } else {
+                        const std::size_t fIdx = state.fragments.size();
+                        Fragment newF{startIdx, endIdx, std::deque<std::int32_t>{sxi, syi, exi, eyi}, false};
+                        state.fragments.push_back(std::move(newF));
+                        state.byStart[startIdx] = fIdx;
+                        state.byEnd[endIdx] = fIdx;
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<ContourLineString> result;
+    for (auto& [levelIndex, state] : levelStates) {
+        const double level = levels[levelIndex];
+        for (auto& f : state.fragments) {
+            if (f.merged) continue;
+            if (f.points.size() < 4) continue;
+            ContourLineString line;
+            line.elevation = level;
+            line.points.assign(f.points.begin(), f.points.end());
+            result.push_back(std::move(line));
+        }
+    }
+
+    return result;
+}
+
 } // namespace contour
 } // namespace algorithm
 } // namespace mbgl
