@@ -1,5 +1,7 @@
 #include <mbgl/renderer/sources/render_contour_source.hpp>
 #include <mbgl/algorithm/contour/intervals.hpp>
+#include <mbgl/algorithm/contour/levels.hpp>
+#include <mbgl/algorithm/contour/units.hpp>
 #include <mbgl/renderer/render_orchestrator.hpp>
 #include <mbgl/renderer/tile_parameters.hpp>
 #include <mbgl/tile/contour_tile.hpp>
@@ -23,6 +25,47 @@ std::int64_t resolveMajorMultiplier(const algorithm::contour::IntervalSchedule& 
     const double v = algorithm::contour::intervalForZoom(schedule, zoom);
     if (v <= 0.0) return 0;
     return static_cast<std::int64_t>(std::llround(v));
+}
+
+// Build the fully-resolved-for-this-tile's-zoom contour parameters from the
+// source's options. Converts every display-unit value to metres up front
+// (heights are always metres; `unit` only affects what's baked into
+// emitted feature properties, handled downstream in contour_tile.cpp).
+ResolvedContourParams resolveParams(const ContourSourceOptions& opts, double zoom) {
+    ResolvedContourParams params;
+    params.unit = opts.unit;
+    params.majorMultiplier = resolveMajorMultiplier(opts.majorMultiplier, zoom);
+
+    if (opts.lineLevels) {
+        // Explicit-levels mode: the resolved level LIST is already in the
+        // source's configured display unit (that's what the style JSON
+        // author wrote, e.g. metres for this app's real config) — convert
+        // every entry to metres individually, same as the scalar interval
+        // path does for a single value.
+        const auto& displayLevels = algorithm::contour::resolveLevels(*opts.lineLevels, zoom);
+        params.lineLevelsMeters.reserve(displayLevels.size());
+        for (double lvl : displayLevels) {
+            params.lineLevelsMeters.push_back(algorithm::contour::unitToMeters(lvl, opts.unit));
+        }
+    } else {
+        params.intervalDisplayUnits = algorithm::contour::intervalForZoom(opts.intervals, zoom);
+        params.intervalMeters = algorithm::contour::unitToMeters(params.intervalDisplayUnits, opts.unit);
+    }
+
+    if (opts.polygonLevels) {
+        const auto& displayLevels = algorithm::contour::resolveLevels(*opts.polygonLevels, zoom);
+        params.polygonLevelsMeters.reserve(displayLevels.size());
+        for (double lvl : displayLevels) {
+            params.polygonLevelsMeters.push_back(algorithm::contour::unitToMeters(lvl, opts.unit));
+        }
+    }
+
+    // Grid-sampling spacing isn't a zoom-schedule value — it's a constant
+    // sample interval in DEM grid units, so no per-zoom resolution needed.
+    params.spotGridSpacing = opts.spotGridSpacing;
+    params.spotSortOrder = opts.spotSortOrder;
+
+    return params;
 }
 
 } // namespace
@@ -101,9 +144,7 @@ void RenderContourSource::update(Immutable<style::Source::Impl> baseImpl_,
                                if (const RasterDEMTile* dem = upstream->getRenderableTile(tileID)) {
                                    const auto& opts = impl().getOptions();
                                    const double zoom = static_cast<double>(tileID.canonical.z);
-                                   const double interval = algorithm::contour::intervalForZoom(opts.intervals, zoom);
-                                   const std::int64_t major = resolveMajorMultiplier(opts.majorMultiplier, zoom);
-                                   tile->populateFromDEM(*dem, interval, major, opts.unit);
+                                   tile->populateFromDEM(*dem, resolveParams(opts, zoom));
                                }
                            }
                            return tile;
@@ -162,9 +203,7 @@ void RenderContourSource::onUpstreamTileLoaded(const RasterDEMTile& demTile) {
     }
     const auto& opts = impl().getOptions();
     const double zoom = static_cast<double>(demTile.id.canonical.z);
-    const double interval = algorithm::contour::intervalForZoom(opts.intervals, zoom);
-    const std::int64_t major = resolveMajorMultiplier(opts.majorMultiplier, zoom);
-    static_cast<ContourTile&>(*match).populateFromDEM(demTile, interval, major, opts.unit);
+    static_cast<ContourTile&>(*match).populateFromDEM(demTile, resolveParams(opts, zoom));
 }
 
 } // namespace mbgl

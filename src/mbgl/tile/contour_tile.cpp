@@ -2,7 +2,9 @@
 
 #include <mbgl/actor/scheduler.hpp>
 #include <mbgl/algorithm/contour/isolines.hpp>
+#include <mbgl/algorithm/contour/polygons.hpp>
 #include <mbgl/algorithm/contour/smoothing.hpp>
+#include <mbgl/algorithm/contour/soundings.hpp>
 #include <mbgl/algorithm/contour/units.hpp>
 #include <mbgl/geometry/dem_data.hpp>
 #include <mbgl/renderer/buckets/hillshade_bucket.hpp>
@@ -15,6 +17,7 @@
 #include <mapbox/feature.hpp>
 #include <mapbox/geometry.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -165,14 +168,24 @@ std::vector<std::vector<algorithm::contour::Point2D>> clipPolylineToTile(
 
 // Convert raw marching-squares output (interleaved int32 tile-local coords
 // with elevation in metres) to vector-tile features.
-//
 // Per-feature properties (per the maplibre-style-spec contour-source
-// proposal, #583):
+// proposal, #583, PLUS a `level` property added for explicit-levels mode --
+// see below):
 //   ele      — elevation in display units (rounded int).
 //   interval — the contour spacing this tile was generated at, in display
-//              units.
+//              units. Constant-interval mode only; 0 in explicit-levels mode
+//              (there is no single spacing to report).
 //   major    — true iff the line's elevation is a multiple of
 //              `interval × majorMultiplier` resolved at this tile's zoom.
+//              Constant-interval mode only; always false in explicit-levels
+//              mode.
+//   level    — EXPLICIT-LEVELS MODE ONLY: this line's index within the
+//              resolved `lineLevelsMeters` array, matching the web app's
+//              CONTOUR_PARAMS.levelKey='level' schema (its
+//              depth-contour-lines paint expression keys line-width off
+//              this property, e.g. `['match', ['get', 'level'], 1, 1.2,
+//              0.6]`). Absent from feature properties in constant-interval
+//              mode (nothing meaningful to report).
 //
 // Pipeline per line:
 //   1. Clip to the [0, EXTENT] tile bbox so endpoints land on the
@@ -187,7 +200,8 @@ mapbox::feature::feature_collection<std::int16_t> toFeatures(
     const std::vector<algorithm::contour::ContourLineString>& lines,
     const algorithm::contour::UnitConfig& unit,
     double intervalDisplayUnits,
-    std::int64_t majorMultiplier) {
+    std::int64_t majorMultiplier,
+    const std::vector<double>* explicitLevelsMeters = nullptr) {
     mapbox::feature::feature_collection<std::int16_t> features;
     features.reserve(lines.size());
 
@@ -225,12 +239,180 @@ mapbox::feature::feature_collection<std::int16_t> toFeatures(
             mapbox::feature::feature<std::int16_t> f;
             f.geometry = std::move(ls);
             f.properties["ele"] = elev;
-            f.properties["interval"] = intervalRound;
-            f.properties["major"] = (majorMod > 0) && (elev % majorMod == 0);
+            if (explicitLevelsMeters != nullptr) {
+                // Explicit-levels mode: report which configured level this
+                // line traces (0-based index), matching the web app's
+                // `levelKey='level'` schema. `line.elevation` is an exact
+                // copy of one of `explicitLevelsMeters`' entries (passed
+                // straight through generateContoursAtLevels), so an exact
+                // equality find is safe -- no floating-point tolerance
+                // needed.
+                const auto it = std::find(explicitLevelsMeters->begin(), explicitLevelsMeters->end(), line.elevation);
+                const std::int64_t levelIndex =
+                    (it != explicitLevelsMeters->end())
+                        ? static_cast<std::int64_t>(std::distance(explicitLevelsMeters->begin(), it))
+                        : 0;
+                f.properties["level"] = levelIndex;
+                f.properties["interval"] = static_cast<std::int64_t>(0);
+                f.properties["major"] = false;
+            } else {
+                f.properties["interval"] = intervalRound;
+                f.properties["major"] = (majorMod > 0) && (elev % majorMod == 0);
+            }
             features.push_back(std::move(f));
         }
     }
     return features;
+}
+
+// Sutherland-Hodgman clip of a CLOSED polygon ring (last point implicitly
+// connects back to the first, per polygons.hpp's convention) against the
+// axis-aligned `[0, EXTENT] x [0, EXTENT]` tile bbox. Unlike the polyline
+// clip above (which must preserve multiple disjoint open sub-polylines),
+// a ring clipped against a rectangle stays a single (possibly degenerate/
+// empty) ring, so the textbook 4-edge sequential clip applies directly.
+// The subject ring may be non-convex in the same saddle-cell cases
+// documented in polygons.cpp; Sutherland-Hodgman against a rectangle
+// (itself convex) is still well-defined for a non-convex subject, it just
+// may occasionally emit a ring with a self-touching vertex at a clip
+// edge -- an acceptable, already-documented tradeoff.
+std::vector<algorithm::contour::Point2D> clipRingToTileBBox(const std::vector<algorithm::contour::Point2D>& ring) {
+    if (ring.size() < 3) return {};
+
+    auto clipEdge = [](const std::vector<algorithm::contour::Point2D>& poly,
+                       auto inside,
+                       auto intersect) -> std::vector<algorithm::contour::Point2D> {
+        std::vector<algorithm::contour::Point2D> out;
+        if (poly.empty()) return out;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const auto& cur = poly[i];
+            const auto& prev = poly[(i + poly.size() - 1) % poly.size()];
+            const bool curIn = inside(cur);
+            const bool prevIn = inside(prev);
+            if (curIn != prevIn) out.push_back(intersect(prev, cur));
+            if (curIn) out.push_back(cur);
+        }
+        return out;
+    };
+
+    constexpr double minX = 0.0;
+    constexpr double minY = 0.0;
+    const double maxX = static_cast<double>(util::EXTENT);
+    const double maxY = static_cast<double>(util::EXTENT);
+
+    auto lerp = [](const algorithm::contour::Point2D& a, const algorithm::contour::Point2D& b, double t) {
+        return algorithm::contour::Point2D{a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])};
+    };
+
+    std::vector<algorithm::contour::Point2D> poly = ring;
+    poly = clipEdge(
+        poly,
+        [&](const algorithm::contour::Point2D& p) { return p[0] >= minX; },
+        [&](const algorithm::contour::Point2D& a, const algorithm::contour::Point2D& b) {
+            return lerp(a, b, (minX - a[0]) / (b[0] - a[0]));
+        });
+    poly = clipEdge(
+        poly,
+        [&](const algorithm::contour::Point2D& p) { return p[0] <= maxX; },
+        [&](const algorithm::contour::Point2D& a, const algorithm::contour::Point2D& b) {
+            return lerp(a, b, (maxX - a[0]) / (b[0] - a[0]));
+        });
+    poly = clipEdge(
+        poly,
+        [&](const algorithm::contour::Point2D& p) { return p[1] >= minY; },
+        [&](const algorithm::contour::Point2D& a, const algorithm::contour::Point2D& b) {
+            return lerp(a, b, (minY - a[1]) / (b[1] - a[1]));
+        });
+    poly = clipEdge(
+        poly,
+        [&](const algorithm::contour::Point2D& p) { return p[1] <= maxY; },
+        [&](const algorithm::contour::Point2D& a, const algorithm::contour::Point2D& b) {
+            return lerp(a, b, (maxY - a[1]) / (b[1] - a[1]));
+        });
+
+    return poly;
+}
+
+// Convert filled-band polygons into MVT polygon features, appending them
+// to an existing (possibly non-empty, since polygons/soundings share one
+// combined feature collection -- see contour_tile.hpp's doc comment on
+// why) feature collection.
+//
+// Per-feature properties: `min` / `max` -- the band's elevation bounds, in
+// display units.
+//
+// Pipeline per ring (mirrors toFeatures' line pipeline, minus smoothing --
+// fill polygons are already a coarse per-cell approximation, so Douglas-
+// Peucker/Chaikin would just move vertices without adding real accuracy):
+//   1. Scale from grid-fractional coordinates to tile-local using the same
+//      `multiplier` the line path uses, then apply the same pixel-center
+//      `shift` -- both parameters passed in identically to how the caller
+//      already computes them for lines, so polygon and line geometry stay
+//      registered to the same coordinate frame.
+//   2. Clip to the [0, EXTENT] tile bbox (clipRingToTileBBox) so adjacent
+//      tiles' fill polygons meet at the seam without gaps or overlaps.
+//   3. Round to int16 MVT coords and emit.
+void appendPolygonFeatures(mapbox::feature::feature_collection<std::int16_t>& features,
+                           const std::vector<algorithm::contour::PolygonBand>& bands,
+                           const algorithm::contour::UnitConfig& unit,
+                           double multiplier,
+                           double shift) {
+    for (const auto& band : bands) {
+        for (const auto& ring : band.rings) {
+            if (ring.size() < 3) continue;
+
+            std::vector<algorithm::contour::Point2D> scaled;
+            scaled.reserve(ring.size());
+            for (const auto& [x, y] : ring) {
+                scaled.push_back({x * multiplier - shift, y * multiplier - shift});
+            }
+
+            const auto clipped = clipRingToTileBBox(scaled);
+            if (clipped.size() < 3) continue;
+
+            mapbox::geometry::linear_ring<std::int16_t> mvtRing;
+            mvtRing.reserve(clipped.size() + 1);
+            for (const auto& p : clipped) {
+                mvtRing.push_back(
+                    {static_cast<std::int16_t>(std::lround(p[0])), static_cast<std::int16_t>(std::lround(p[1]))});
+            }
+            mvtRing.push_back(mvtRing.front()); // close the ring (mapbox::geometry convention)
+
+            mapbox::geometry::polygon<std::int16_t> polygon;
+            polygon.push_back(std::move(mvtRing));
+
+            mapbox::feature::feature<std::int16_t> f;
+            f.geometry = std::move(polygon);
+            f.properties["min"] = static_cast<std::int64_t>(std::llround(algorithm::contour::metersToUnit(band.minElevation, unit)));
+            f.properties["max"] = static_cast<std::int64_t>(std::llround(algorithm::contour::metersToUnit(band.maxElevation, unit)));
+            features.push_back(std::move(f));
+        }
+    }
+}
+
+// Convert spot-sounding grid samples into MVT point features, appending to
+// the shared combined collection. Per-feature property: `ele` (elevation
+// in display units). Soundings outside the tile bbox after scaling/shift
+// are simply dropped -- a single point either lands in the tile or it
+// doesn't; no clipping is meaningful the way it is for lines/polygons.
+void appendSoundingFeatures(mapbox::feature::feature_collection<std::int16_t>& features,
+                            const std::vector<algorithm::contour::SpotSounding>& soundings,
+                            const algorithm::contour::UnitConfig& unit,
+                            double multiplier,
+                            double shift) {
+    const double maxCoord = static_cast<double>(util::EXTENT);
+    for (const auto& s : soundings) {
+        const double x = s.x * multiplier - shift;
+        const double y = s.y * multiplier - shift;
+        if (x < 0.0 || x > maxCoord || y < 0.0 || y > maxCoord) continue;
+
+        mapbox::feature::feature<std::int16_t> f;
+        f.geometry = mapbox::geometry::point<std::int16_t>{static_cast<std::int16_t>(std::lround(x)),
+                                                            static_cast<std::int16_t>(std::lround(y))};
+        f.properties["ele"] =
+            static_cast<std::int64_t>(std::llround(algorithm::contour::metersToUnit(s.elevation, unit)));
+        features.push_back(std::move(f));
+    }
 }
 
 } // namespace
@@ -241,10 +423,7 @@ ContourTile::ContourTile(const OverscaledTileID& id_,
                          TileObserver* observer_)
     : GeometryTile(id_, std::move(sourceID_), parameters, observer_) {}
 
-void ContourTile::populateFromDEM(const RasterDEMTile& demTile,
-                                  double intervalDisplayUnits,
-                                  std::int64_t majorMultiplier,
-                                  const algorithm::contour::UnitConfig& unit) {
+void ContourTile::populateFromDEM(const RasterDEMTile& demTile, const ResolvedContourParams& params) {
     HillshadeBucket* bucket = demTile.getBucket();
     if (bucket == nullptr) return;
     const DEMData& dem = bucket->getDEMData();
@@ -261,10 +440,12 @@ void ContourTile::populateFromDEM(const RasterDEMTile& demTile,
     // skirt extends two cells past the tile edge on every side, which
     // gives the downstream Douglas-Peucker / Chaikin smoothing more
     // context near the boundary so adjacent tiles' smoothed contours
-    // share a tangent direction at the seam, not just an endpoint.
-    // Adjacent tiles' overlapping output regions are clipped during
-    // rendering, so the extra width costs only a small per-tile
-    // generation step.
+    // share a tangent direction at the seam, not just an endpoint. The
+    // same buffered grid is reused for polygon and sounding generation
+    // (single DEM decode/snapshot serving all three outputs — see
+    // contour_tile.hpp's doc comment). Adjacent tiles' overlapping output
+    // regions are clipped during rendering, so the extra width costs only
+    // a small per-tile generation step.
     //
     // Snapshot here on the render thread because backfillBorder mutates
     // the same image asynchronously when more neighbours arrive.
@@ -279,50 +460,57 @@ void ContourTile::populateFromDEM(const RasterDEMTile& demTile,
         }
     }
 
-    // The configured `intervalDisplayUnits` is in display units (feet,
-    // metres, custom). Heights are always metres. Convert the threshold to
-    // metres before running the algorithm so its level outputs come back in
-    // metres too, then convert per-feature `ele` back to display units in
-    // `toFeatures`.
-    const double intervalMeters = algorithm::contour::unitToMeters(intervalDisplayUnits, unit);
-
     Scheduler::GetBackground()->scheduleAndReplyValue(
         util::SimpleIdentity::Empty,
-        [heights, width, dim, intervalMeters, intervalDisplayUnits, majorMultiplier, unit]() {
-            algorithm::contour::ContourThresholds thresholds;
-            thresholds.interval = intervalMeters;
-            // Pixel-center coordinate mapping. We want:
+        [heights, width, dim, params]() {
+            // Pixel-center coordinate mapping (shared by lines, polygons,
+            // and soundings — all sample the same buffered grid). We want:
             //   alg index `border`     (sample 0, world west_L + 0.5cw) → tile-local +0.5cw
             //   alg index `border+dim-1` (sample dim-1, east_L − 0.5cw) → EXTENT − 0.5cw
             //   alg indices [0, border-1] and [border+dim, width-1]    → outside the tile,
             //                                                            in the neighbour's interior
             //
-            // The algorithm internally uses
-            //   multiplier = thresholds.extent / (width - 1)
-            // and emits output at multiplier·index. We want
+            // The line algorithms internally use
+            //   multiplier = extent / (width - 1)
+            // and emit output at multiplier·index. We want
             //   multiplier = EXTENT / dim
             // so each cell spans one tile-local cell width, no matter how
             // wide the buffered view is. That gives
-            //   thresholds.extent = EXTENT × (width - 1) / dim
+            //   extent = EXTENT × (width - 1) / dim
             //
             // The boundary cell on each tile (heights[border-1..border]
             // on the west, heights[width-2..width-1] on the east, after
             // backfillBorder) straddles the tile edge using identical
-            // neighbour data, so adjacent tiles' contour features meet
-            // exactly at the seam.
-            thresholds.extent = static_cast<int>(std::lround(
+            // neighbour data, so adjacent tiles' features meet exactly at
+            // the seam.
+            const int extent = static_cast<int>(std::lround(
                 static_cast<double>(util::EXTENT) * static_cast<double>(width - 1) / static_cast<double>(dim)));
-            const auto lines = algorithm::contour::generateContours(*heights, width, width, thresholds);
+            const double multiplier = static_cast<double>(extent) / static_cast<double>(width - 1);
 
             // Shift so alg index `border` lands at +0.5cw (sample 0's
             // pixel-center position). At border = 1 this is −0.5cw.
             // At border = 2 it is −1.5cw — alg index 0 (outer west
             // border) sits one cell further west than the inner border
-            // cell did before.
+            // cell did before. This shift is already in tile-local
+            // (post-multiplier) units, so it's subtracted directly from
+            // already-scaled coordinates (lines) or from grid-fractional
+            // coordinates multiplied by `multiplier` first (polygons,
+            // soundings) — see appendPolygonFeatures / appendSoundingFeatures.
             const double halfCellPx = 0.5 * static_cast<double>(util::EXTENT) / static_cast<double>(dim);
             const double shift = halfCellPx * static_cast<double>(2 * DEMData::border - 1);
-            std::vector<algorithm::contour::ContourLineString> shifted;
-            shifted.reserve(lines.size());
+
+            mapbox::feature::feature_collection<std::int16_t> combined;
+
+            // --- Lines: exactly one of explicit-levels / constant-interval mode ---
+            const bool explicitLevels = !params.lineLevelsMeters.empty();
+            const auto lines = explicitLevels
+                                    ? algorithm::contour::generateContoursAtLevels(
+                                          *heights, width, width, params.lineLevelsMeters, extent)
+                                    : algorithm::contour::generateContours(
+                                          *heights, width, width, algorithm::contour::ContourThresholds{params.intervalMeters, extent});
+
+            std::vector<algorithm::contour::ContourLineString> shiftedLines;
+            shiftedLines.reserve(lines.size());
             for (const auto& line : lines) {
                 algorithm::contour::ContourLineString s;
                 s.elevation = line.elevation;
@@ -331,9 +519,30 @@ void ContourTile::populateFromDEM(const RasterDEMTile& demTile,
                     s.points.push_back(static_cast<std::int32_t>(std::lround(line.points[i] - shift)));
                     s.points.push_back(static_cast<std::int32_t>(std::lround(line.points[i + 1] - shift)));
                 }
-                shifted.push_back(std::move(s));
+                shiftedLines.push_back(std::move(s));
             }
-            return toFeatures(shifted, unit, intervalDisplayUnits, majorMultiplier);
+            auto lineFeatures = toFeatures(shiftedLines,
+                                          params.unit,
+                                          params.intervalDisplayUnits,
+                                          params.majorMultiplier,
+                                          explicitLevels ? &params.lineLevelsMeters : nullptr);
+            combined.reserve(lineFeatures.size());
+            for (auto& f : lineFeatures) combined.push_back(std::move(f));
+
+            // --- Polygons (optional) ---
+            if (!params.polygonLevelsMeters.empty()) {
+                const auto bands = algorithm::contour::generatePolygons(*heights, width, width, params.polygonLevelsMeters);
+                appendPolygonFeatures(combined, bands, params.unit, multiplier, shift);
+            }
+
+            // --- Spot soundings (optional) ---
+            if (params.spotGridSpacing > 0) {
+                const auto soundings = algorithm::contour::generateSoundings(
+                    *heights, width, width, params.spotGridSpacing, params.spotSortOrder);
+                appendSoundingFeatures(combined, soundings, params.unit, multiplier, shift);
+            }
+
+            return combined;
         },
         [self = weakFactory.makeWeakPtr(), this](mapbox::feature::feature_collection<std::int16_t> features) {
             if (auto guard = self.lock(); self) {
