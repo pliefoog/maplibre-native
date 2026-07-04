@@ -23,6 +23,34 @@ const algorithm::contour::IntervalSchedule& ContourSource::getIntervals() const 
     return impl().getOptions().intervals;
 }
 
+const std::optional<algorithm::contour::LevelSchedule>& ContourSource::getLineLevels() const {
+    return impl().getOptions().lineLevels;
+}
+
+const std::optional<algorithm::contour::LevelSchedule>& ContourSource::getPolygonLevels() const {
+    return impl().getOptions().polygonLevels;
+}
+
+int ContourSource::getSpotGridSpacing() const {
+    return impl().getOptions().spotGridSpacing;
+}
+
+algorithm::contour::SpotSortOrder ContourSource::getSpotSortOrder() const {
+    return impl().getOptions().spotSortOrder;
+}
+
+const std::string& ContourSource::getContourLayer() const {
+    return impl().getOptions().contourLayer;
+}
+
+const std::string& ContourSource::getPolygonLayer() const {
+    return impl().getOptions().polygonLayer;
+}
+
+const std::string& ContourSource::getSpotLayer() const {
+    return impl().getOptions().spotLayer;
+}
+
 const algorithm::contour::UnitConfig& ContourSource::getUnit() const {
     return impl().getOptions().unit;
 }

@@ -13,11 +13,71 @@
 #include <mbgl/style/sources/image_source.hpp>
 #include <mbgl/util/geo.hpp>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace mbgl {
 namespace style {
 namespace conversion {
+
+namespace {
+
+// Parse a zoom-keyed object of ascending number arrays into a LevelSchedule,
+// e.g. `{ "5": [0, 2, 5, 10, 20] }`. Used for both `lineLevels` and
+// `polygonLevels` -- same shape, different semantic (line thresholds vs.
+// fill-band boundaries), see algorithm/contour/levels.hpp.
+std::optional<algorithm::contour::LevelSchedule> parseLevelSchedule(const Convertible& value,
+                                                                    const char* fieldName,
+                                                                    Error& error) {
+    if (!isObject(value)) {
+        error.message = std::string("contour `") + fieldName + "` must be an object mapping zoom to level arrays";
+        return std::nullopt;
+    }
+
+    algorithm::contour::LevelSchedule schedule;
+    bool ok = true;
+    auto parseError = eachMember(value, [&](const std::string& key, const Convertible& arrVal) -> std::optional<Error> {
+        char* end = nullptr;
+        const double zoomBreak = std::strtod(key.c_str(), &end);
+        if (end == key.c_str() || *end != '\0') {
+            return Error{std::string("contour `") + fieldName + "` keys must be numeric zoom levels"};
+        }
+        if (!isArray(arrVal) || arrayLength(arrVal) == 0) {
+            return Error{std::string("contour `") + fieldName + "` entries must be non-empty arrays"};
+        }
+        std::vector<double> levels;
+        levels.reserve(arrayLength(arrVal));
+        for (std::size_t i = 0; i < arrayLength(arrVal); i++) {
+            auto v = toDouble(arrayMember(arrVal, i));
+            if (!v) {
+                return Error{std::string("contour `") + fieldName + "` array entries must be numbers"};
+            }
+            levels.push_back(*v);
+        }
+        schedule.entries.emplace_back(zoomBreak, std::move(levels));
+        return std::nullopt;
+    });
+    if (parseError) {
+        error = *parseError;
+        ok = false;
+    }
+    if (!ok) return std::nullopt;
+
+    std::sort(schedule.entries.begin(), schedule.entries.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+    if (!algorithm::contour::isValid(schedule)) {
+        error.message = std::string("contour `") + fieldName +
+                       "` must have strictly-increasing zoom keys and strictly-increasing level arrays of at "
+                       "least 2 entries each";
+        return std::nullopt;
+    }
+    return schedule;
+}
+
+} // namespace
 
 namespace {
 // A tile source can either specify a URL to TileJSON, or inline TileJSON.
@@ -183,34 +243,93 @@ std::optional<std::unique_ptr<Source>> convertContourSource(const std::string& i
     options.sourceID = std::move(*sourceStr);
 
     // Required: intervals — odd-length number array of step-by-zoom outputs
-    // and stops, with strictly-positive outputs.
+    // and stops, with strictly-positive outputs. Mutually exclusive with
+    // `lineLevels` (see below): a source that sets neither fails to parse;
+    // a source that sets both also fails, to avoid silently picking one.
     auto intervalsVal = objectMember(value, "intervals");
-    if (!intervalsVal) {
-        error.message = "contour source must specify `intervals`";
+    auto lineLevelsVal = objectMember(value, "lineLevels");
+    if (!intervalsVal && !lineLevelsVal) {
+        error.message = "contour source must specify either `intervals` or `lineLevels`";
         return std::nullopt;
     }
-    if (!isArray(*intervalsVal) || arrayLength(*intervalsVal) == 0) {
-        error.message = "contour `intervals` must be a non-empty array";
+    if (intervalsVal && lineLevelsVal) {
+        error.message = "contour source must specify only one of `intervals` or `lineLevels`, not both";
         return std::nullopt;
     }
-    const std::size_t n = arrayLength(*intervalsVal);
-    if ((n % 2) == 0) {
-        error.message =
-            "contour `intervals` must have an odd number of entries (output, stop, output, stop, ..., output)";
-        return std::nullopt;
-    }
-    options.intervals.stops.reserve(n);
-    for (std::size_t i = 0; i < n; i++) {
-        auto entry = toDouble(arrayMember(*intervalsVal, i));
-        if (!entry) {
-            error.message = "contour `intervals` entries must be numbers";
+    if (lineLevelsVal) {
+        auto schedule = parseLevelSchedule(*lineLevelsVal, "lineLevels", error);
+        if (!schedule) return std::nullopt;
+        options.lineLevels = std::move(schedule);
+    } else {
+        if (!isArray(*intervalsVal) || arrayLength(*intervalsVal) == 0) {
+            error.message = "contour `intervals` must be a non-empty array";
             return std::nullopt;
         }
-        options.intervals.stops.push_back(*entry);
+        const std::size_t n = arrayLength(*intervalsVal);
+        if ((n % 2) == 0) {
+            error.message =
+                "contour `intervals` must have an odd number of entries (output, stop, output, stop, ..., output)";
+            return std::nullopt;
+        }
+        options.intervals.stops.reserve(n);
+        for (std::size_t i = 0; i < n; i++) {
+            auto entry = toDouble(arrayMember(*intervalsVal, i));
+            if (!entry) {
+                error.message = "contour `intervals` entries must be numbers";
+                return std::nullopt;
+            }
+            options.intervals.stops.push_back(*entry);
+        }
+        if (!algorithm::contour::isValid(options.intervals)) {
+            error.message = "contour `intervals` outputs must be > 0 and stops strictly increasing";
+            return std::nullopt;
+        }
     }
-    if (!algorithm::contour::isValid(options.intervals)) {
-        error.message = "contour `intervals` outputs must be > 0 and stops strictly increasing";
-        return std::nullopt;
+
+    // Optional: polygonLevels — same zoom-keyed-array-of-levels shape as
+    // `lineLevels`, but defines filled-band boundaries (adjacent pairs)
+    // instead of line thresholds. Absent disables polygon-fill generation.
+    if (auto polygonLevelsVal = objectMember(value, "polygonLevels")) {
+        auto schedule = parseLevelSchedule(*polygonLevelsVal, "polygonLevels", error);
+        if (!schedule) return std::nullopt;
+        options.polygonLevels = std::move(schedule);
+    }
+
+    // Optional: spotGridSpacing — positive integer grid-sample spacing for
+    // spot-sounding point features. Absent/0 disables spot-sounding
+    // generation.
+    if (auto spacingVal = objectMember(value, "spotGridSpacing")) {
+        auto spacingNum = toDouble(*spacingVal);
+        if (!spacingNum || *spacingNum <= 0.0 || *spacingNum != std::floor(*spacingNum)) {
+            error.message = "contour `spotGridSpacing` must be a positive integer";
+            return std::nullopt;
+        }
+        options.spotGridSpacing = static_cast<int>(*spacingNum);
+    }
+
+    // Optional: spotSortOrder — "asc" (default) or "desc".
+    if (auto sortVal = objectMember(value, "spotSortOrder")) {
+        auto sortStr = toString(*sortVal);
+        if (sortStr && *sortStr == "asc") {
+            options.spotSortOrder = algorithm::contour::SpotSortOrder::Ascending;
+        } else if (sortStr && *sortStr == "desc") {
+            options.spotSortOrder = algorithm::contour::SpotSortOrder::Descending;
+        } else {
+            error.message = "contour `spotSortOrder` must be \"asc\" or \"desc\"";
+            return std::nullopt;
+        }
+    }
+
+    // Optional: source-layer name overrides. Defaults already set on
+    // ContourSourceOptions match this app's generate-map-style.js schema.
+    if (auto v = objectMember(value, "contourLayer")) {
+        if (auto s = toString(*v)) options.contourLayer = *s;
+    }
+    if (auto v = objectMember(value, "polygonLayer")) {
+        if (auto s = toString(*v)) options.polygonLayer = *s;
+    }
+    if (auto v = objectMember(value, "spotLayer")) {
+        if (auto s = toString(*v)) options.spotLayer = *s;
     }
 
     // Optional: unit — "meters" (default), "feet", or a positive number used
