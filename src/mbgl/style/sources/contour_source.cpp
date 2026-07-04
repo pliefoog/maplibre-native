@@ -51,6 +51,10 @@ const std::string& ContourSource::getSpotLayer() const {
     return impl().getOptions().spotLayer;
 }
 
+double ContourSource::getMultiplier() const {
+    return impl().getOptions().multiplier;
+}
+
 const algorithm::contour::UnitConfig& ContourSource::getUnit() const {
     return impl().getOptions().unit;
 }

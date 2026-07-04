@@ -34,6 +34,7 @@ std::int64_t resolveMajorMultiplier(const algorithm::contour::IntervalSchedule& 
 ResolvedContourParams resolveParams(const ContourSourceOptions& opts, double zoom) {
     ResolvedContourParams params;
     params.unit = opts.unit;
+    params.multiplier = opts.multiplier;
     params.majorMultiplier = resolveMajorMultiplier(opts.majorMultiplier, zoom);
 
     if (opts.lineLevels) {

@@ -64,6 +64,13 @@ struct ContourSourceOptions {
     std::string contourLayer = "contours";
     std::string polygonLayer = "bathymetry";
     std::string spotLayer = "soundings";
+    // Multiply every decoded DEM elevation sample by this factor before
+    // running any generation algorithm (lines, polygons, or soundings).
+    // Matches the web app's `CONTOUR_PARAMS.multiplier` (e.g. -1 so ocean
+    // depth reads as a positive number instead of the DEM's natural
+    // negative-below-sea-level convention). Applied once, at DEM decode
+    // time (see ContourTile::populateFromDEM), not per-algorithm.
+    double multiplier = 1.0;
     // Display unit for emitted `ele` / `interval` feature attributes. Defaults
     // to metres; the underlying DEM is always interpreted as metres.
     algorithm::contour::UnitConfig unit;
@@ -98,6 +105,7 @@ public:
     const std::string& getContourLayer() const;
     const std::string& getPolygonLayer() const;
     const std::string& getSpotLayer() const;
+    double getMultiplier() const;
     const algorithm::contour::UnitConfig& getUnit() const;
     const algorithm::contour::IntervalSchedule& getMajorMultiplier() const;
     std::uint8_t getOverzoom() const;

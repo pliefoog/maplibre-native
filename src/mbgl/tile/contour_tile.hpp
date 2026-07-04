@@ -44,6 +44,10 @@ struct ResolvedContourParams {
 
     std::int64_t majorMultiplier = 0;
     algorithm::contour::UnitConfig unit;
+    // Applied to every decoded DEM elevation sample before any generation
+    // algorithm runs (e.g. -1 so depth reads positive). See
+    // ContourSourceOptions::multiplier for the full rationale.
+    double multiplier = 1.0;
 };
 
 // A vector-tile that renders contour-line, fill-polygon, and spot-sounding

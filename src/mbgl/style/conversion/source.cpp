@@ -332,6 +332,20 @@ std::optional<std::unique_ptr<Source>> convertContourSource(const std::string& i
         if (auto s = toString(*v)) options.spotLayer = *s;
     }
 
+    // Optional: multiplier — applied to every decoded DEM elevation sample
+    // before generation (e.g. -1 so depth reads positive instead of the
+    // DEM's natural negative-below-sea-level convention). Matches the web
+    // app's CONTOUR_PARAMS.multiplier. Zero is rejected (would flatten all
+    // elevation data to 0, silently disabling every output).
+    if (auto multVal = objectMember(value, "multiplier")) {
+        auto multNum = toDouble(*multVal);
+        if (!multNum || *multNum == 0.0) {
+            error.message = "contour `multiplier` must be a non-zero number";
+            return std::nullopt;
+        }
+        options.multiplier = *multNum;
+    }
+
     // Optional: unit — "meters" (default), "feet", or a positive number used
     // as a metres-to-display multiplier.
     if (auto unitVal = objectMember(value, "unit")) {

@@ -456,7 +456,13 @@ void ContourTile::populateFromDEM(const RasterDEMTile& demTile, const ResolvedCo
     heights->reserve(static_cast<std::size_t>(width) * width);
     for (int y = -border; y < dim + border; y++) {
         for (int x = -border; x < dim + border; x++) {
-            heights->push_back(static_cast<std::int16_t>(dem.get(x, y)));
+            // Apply the source's `multiplier` here, once, at decode time --
+            // every downstream algorithm (lines, polygons, soundings) then
+            // sees already-flipped/scaled elevation values, and every
+            // level/interval/band threshold the style author configured is
+            // compared directly against them with no further adjustment
+            // needed at generation or emission time.
+            heights->push_back(static_cast<std::int16_t>(std::lround(dem.get(x, y) * params.multiplier)));
         }
     }
 
